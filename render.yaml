@@ -2,20 +2,26 @@ services:
   - type: web
     name: gods-time-lodge
     runtime: node
-    plan: starter
+    # Free compute plan works without a payment method on file.
+    plan: free
+    region: oregon
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /healthz
     envVars:
+      # Neon Postgres connection string. Accounts live here, so they survive
+      # restarts and redeploys on the free plan (no disk required).
+      # Set it in the Render Dashboard; never commit the real value.
+      - key: DATABASE_URL
+        sync: false
+      # Only used when DATABASE_URL is empty (local JSON fallback).
       - key: DATA_DIR
-        value: /var/data
+        value: ./data
       - key: ADMIN_EMAIL
         value: admin@godstimelodge.com
+      # Auto-generated on first deploy. Retrieve it from the service's
+      # Environment tab, or from the boot logs ("Admin login: ...").
       - key: ADMIN_PASSWORD
-        sync: false
+        generateValue: true
       - key: COOKIE_SECURE
         value: "true"
-    disk:
-      name: data
-      mountPath: /var/data
-      sizeGB: 1

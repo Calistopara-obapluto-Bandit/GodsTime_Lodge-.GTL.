@@ -3,6 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { URL } = require("url");
+const { createStorage } = require("./storage");
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || "0.0.0.0";
@@ -16,9 +17,11 @@ const DB_PATH = path.join(DATA_DIR, "node-db.json");
 const PUBLIC_DIR = path.join(__dirname, "public");
 const ASSETS_DIR = path.join(PUBLIC_DIR, "assets");
 
-function ensureDataDir() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-}
+const storage = createStorage({
+  dataDir: DATA_DIR,
+  dbPath: DB_PATH,
+  connectionString: process.env.DATABASE_URL,
+});
 
 function randomId(len = 24) {
   return crypto.randomBytes(len).toString("hex");
@@ -45,26 +48,14 @@ function createUser({ email, password, role, fullName, unit }) {
   };
 }
 
-function loadDb() {
-  ensureDataDir();
-  if (!fs.existsSync(DB_PATH)) {
-    const admin = createUser({
-      email: ADMIN_EMAIL,
-      password: ADMIN_PASSWORD,
-      role: "admin",
-      fullName: "Admin",
-      unit: "",
-    });
-    const db = { users: [admin] };
-    fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), "utf8");
-  }
-  return JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
-}
-
-function saveDb(db) {
-  ensureDataDir();
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), "utf8");
-}
+// Seeded on boot when no account with this email exists yet.
+const seedAdmin = createUser({
+  email: ADMIN_EMAIL,
+  password: ADMIN_PASSWORD,
+  role: "admin",
+  fullName: "Admin",
+  unit: "",
+});
 
 const sessions = new Map();
 
@@ -81,14 +72,13 @@ function parseCookies(req) {
   return out;
 }
 
-function getCurrentUser(req) {
+async function getCurrentUser(req) {
   const cookies = parseCookies(req);
   const sid = cookies.gtl_session;
   if (!sid) return null;
   const userId = sessions.get(sid);
   if (!userId) return null;
-  const db = loadDb();
-  return db.users.find((u) => u.id === userId) || null;
+  return await storage.findUserById(userId);
 }
 
 function redirect(res, to) {
@@ -297,8 +287,8 @@ function tenantDashboardView(user) {
   );
 }
 
-function requireLogin(req, res) {
-  const user = getCurrentUser(req);
+async function requireLogin(req, res) {
+  const user = await getCurrentUser(req);
   if (!user) {
     redirect(res, "/login");
     return null;
@@ -306,8 +296,8 @@ function requireLogin(req, res) {
   return user;
 }
 
-function requireRole(req, res, role) {
-  const user = requireLogin(req, res);
+async function requireRole(req, res, role) {
+  const user = await requireLogin(req, res);
   if (!user) return null;
   if (user.role !== role) {
     sendText(res, 403, "Forbidden");
@@ -336,7 +326,7 @@ function serveStatic(res, pathname) {
   return true;
 }
 
-const server = http.createServer(async (req, res) => {
+async function handleRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
   const method = (req.method || "GET").toUpperCase();
@@ -349,7 +339,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (pathname === "/") {
-    const user = getCurrentUser(req);
+    const user = await getCurrentUser(req);
     if (user) {
       return redirect(res, user.role === "tenant" ? "/tenant/dashboard" : "/admin/dashboard");
     }
@@ -364,8 +354,7 @@ const server = http.createServer(async (req, res) => {
     const form = parseForm(body);
     const email = String(form.email || "").trim().toLowerCase();
     const password = String(form.password || "");
-    const db = loadDb();
-    const user = db.users.find((u) => u.email === email);
+    const user = await storage.findUserByEmail(email);
     if (!user) return send(res, 401, loginView("Invalid email or password."));
     const hash = pbkdf2Hash(password, user.saltHex);
     if (hash !== user.passwordHash) return send(res, 401, loginView("Invalid email or password."));
@@ -387,11 +376,15 @@ const server = http.createServer(async (req, res) => {
     if (!fullName || !email || !password) return send(res, 400, registerView("Please fill all required fields."));
     if (password.length < 6) return send(res, 400, registerView("Password must be at least 6 characters."));
 
-    const db = loadDb();
-    if (db.users.some((u) => u.email === email)) return send(res, 400, registerView("This email is already registered."));
+    const existing = await storage.findUserByEmail(email);
+    if (existing) return send(res, 400, registerView("This email is already registered."));
     const tenant = createUser({ email, password, role: "tenant", fullName, unit });
-    db.users.push(tenant);
-    saveDb(db);
+    try {
+      await storage.insertUser(tenant);
+    } catch (err) {
+      if (err.code === "DUPLICATE_EMAIL") return send(res, 400, registerView("This email is already registered."));
+      throw err;
+    }
 
     const sid = randomId(18);
     sessions.set(sid, tenant.id);
@@ -408,13 +401,13 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (pathname === "/tenant/dashboard") {
-    const user = requireRole(req, res, "tenant");
+    const user = await requireRole(req, res, "tenant");
     if (!user) return;
     return send(res, 200, tenantDashboardView(user));
   }
 
   if (pathname === "/admin/dashboard") {
-    const user = requireRole(req, res, "admin");
+    const user = await requireRole(req, res, "admin");
     if (!user) return;
     const adminFile = path.join(PUBLIC_DIR, "admin-dashboard.html");
     if (fs.existsSync(adminFile)) {
@@ -425,12 +418,31 @@ const server = http.createServer(async (req, res) => {
   }
 
   sendText(res, 404, "Not found");
+}
+
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch((err) => {
+    console.error("Request failed:", err.message);
+    if (res.headersSent) return res.end();
+    sendText(res, 500, "Server error");
+  });
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`Server running at http://${HOST}:${PORT}`);
-  console.log("Tenant register: /register");
-  console.log("Tenant dashboard: /tenant/dashboard");
-  console.log("Admin tenants: /admin/tenants");
-  console.log(`Admin login: ${ADMIN_EMAIL} / ${ADMIN_PASSWORD}`);
-});
+async function start() {
+  try {
+    await storage.init({ seedUsers: [seedAdmin] });
+  } catch (err) {
+    console.error(`Storage init failed (${storage.backendName}): ${err.message}`);
+    process.exit(1);
+  }
+
+  server.listen(PORT, HOST, () => {
+    console.log(`Server running at http://${HOST}:${PORT}`);
+    console.log(`Storage: ${storage.backendName}`);
+    console.log("Tenant register: /register");
+    console.log("Tenant dashboard: /tenant/dashboard");
+    console.log(`Admin login: ${ADMIN_EMAIL} / ${ADMIN_PASSWORD}`);
+  });
+}
+
+start();
